@@ -1,89 +1,100 @@
 from flask import Flask, request, jsonify
 import requests
 import base64
-from base64 import b64decode
+from base64 import urlsafe_b64decode
 from Crypto.Cipher import AES
 from Crypto.Protocol.KDF import HKDF
 from Crypto.Hash import SHA256
+from Crypto.Util.Padding import unpad
 
 app = Flask(__name__)
 
+def _b64_urlsafe_decode(s: str) -> bytes:
+    # corrige padding
+    s = s.replace('-', '+').replace('_', '/')
+    padding = len(s) % 4
+    if padding:
+        s += "=" * (4 - padding)
+    return base64.b64decode(s)
+
 @app.route("/decode-media", methods=["POST"])
 def decode_media():
-    data = request.get_json()
+    payload = request.get_json(force=True)
 
-    media_url = data.get("media_url")
-    media_key_b64 = data.get("media_key")
-    mimetype = data.get("mimetype")  # Ex: "image/jpeg", "audio/ogg"
+    media_url = payload.get("media_url")
+    media_key_b64 = payload.get("media_key")
+    mimetype = payload.get("mimetype")  # Ex: "image/jpeg"
+    auth_token = payload.get("auth_token")  # opcional: Bearer token para baixar o arquivo
 
     if not media_url or not media_key_b64 or not mimetype:
         return jsonify({"error": "Parâmetros 'media_url', 'media_key' e 'mimetype' são obrigatórios"}), 400
 
     try:
-        # Download do arquivo criptografado
-        response = requests.get(media_url)
-        enc_data = response.content
+        # headers opcionais para baixar o arquivo (WhatsApp Cloud API exige Authorization)
+        headers = {}
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token}"
 
-        media_key = b64decode(media_key_b64)
+        resp = requests.get(media_url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            return jsonify({
+                "error": "Falha ao baixar mídia",
+                "http_status": resp.status_code,
+                "content_type": resp.headers.get("content-type")
+            }), 400
 
-        # Seleção do tipo de mídia
+        enc_data = resp.content
+        if not enc_data or len(enc_data) <= 10:
+            return jsonify({"error": "Arquivo de mídia inválido ou muito curto"}), 400
+
+        # decode media_key (tratar como base64 url-safe)
+        try:
+            media_key = _b64_urlsafe_decode(media_key_b64)
+        except Exception as e:
+            return jsonify({"error": "media_key inválido (base64)", "details": str(e)}), 400
+
+        if len(media_key) != 32:
+            return jsonify({
+                "error": "media_key decodificado não tem 32 bytes (provável chave errada)",
+                "media_key_len": len(media_key)
+            }), 400
+
+        # tipo de mídia (info string usada no HKDF)
         if mimetype.startswith("image/"):
-            # Verificação especial para stickers (normalmente webp)
-            if mimetype == "image/webp":
-                media_type = b'WhatsApp Sticker Keys'
-            else:
-                media_type = b'WhatsApp Image Keys'
+            info = b"WhatsApp Image Keys"
         elif mimetype.startswith("audio/"):
-            media_type = b'WhatsApp Audio Keys'
+            info = b"WhatsApp Audio Keys"
         elif mimetype.startswith("video/"):
-            media_type = b'WhatsApp Video Keys'
-        elif mimetype.startswith("application/"):
-            media_type = b'WhatsApp Document Keys'
+            info = b"WhatsApp Video Keys"
+        elif mimetype.startswith("application/") or mimetype.startswith("text/") or mimetype.startswith("model/"):
+            info = b"WhatsApp Document Keys"
         else:
             return jsonify({"error": f"Tipo de mídia não suportado: {mimetype}"}), 400
 
-        # Derivação das chaves
-        expanded_key = HKDF(
-            master=media_key,
-            key_len=112,
-            salt=None,
-            hashmod=SHA256,
-            num_keys=1,
-            context=media_type
-        )
-
+        # HKDF -> 112 bytes (iv, encKey, macKey, refKey)
+        expanded_key = HKDF(master=media_key, key_len=112, salt=None, hashmod=SHA256, num_keys=1, context=info)
         iv = expanded_key[0:16]
-        cipher_key = expanded_key[16:48]
+        enc_key = expanded_key[16:48]
+        # mac_key = expanded_key[48:80]  # se precisar validar MAC
+        # ref_key = expanded_key[80:112]
 
-        # Remover MAC (últimos 10 bytes)
-        encrypted_payload = enc_data[:-10]
-        payload_length = len(encrypted_payload)
+        # remover os últimos 10 bytes (MAC) antes da descriptografia
+        ciphertext = enc_data[:-10]
 
-        # Verificação: payload precisa ser múltiplo de 16
-        if payload_length % 16 != 0:
-            return jsonify({
-                "error": f"O payload criptografado deve ter tamanho múltiplo de 16 após remover o MAC, mas tem {payload_length} bytes."
-            }), 400
+        cipher = AES.new(enc_key, AES.MODE_CBC, iv)
+        decrypted = cipher.decrypt(ciphertext)
 
-        cipher = AES.new(cipher_key, AES.MODE_CBC, iv)
-        decrypted = cipher.decrypt(encrypted_payload)
+        # valida e remove padding PKCS7
+        try:
+            unpadded = unpad(decrypted, AES.block_size)
+        except ValueError as e:
+            return jsonify({"error": "Padding inválido na descriptografia", "details": str(e)}), 400
 
-        # Remover padding PKCS#7
-        pad_len = decrypted[-1]
-        if pad_len < 1 or pad_len > 16:
-            return jsonify({"error": "Padding inválido na descriptografia"}), 400
-        decrypted = decrypted[:-pad_len]
-
-        # Retornar em base64
-        base64_media = base64.b64encode(decrypted).decode("utf-8")
-
-        return jsonify({
-            "success": True,
-            "base64": base64_media
-        })
+        base64_media = base64.b64encode(unpadded).decode("utf-8")
+        return jsonify({"success": True, "base64": base64_media})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Erro interno", "details": str(e)}), 500
 
 if __name__ == "__main__":
     import os
