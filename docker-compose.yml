@@ -1,0 +1,9 @@
+services:
+  decryptor:
+    build: .
+    container_name: decryptor
+    ports:
+      - "5005:8080"
+    restart: unless-stopped
+    environment:
+      - TZ=America/Sao_Paulo
